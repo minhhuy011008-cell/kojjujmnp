@@ -1,0 +1,703 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+if _G.DeltaSpyProLoaded and _G.DeltaSpyProGui and _G.DeltaSpyProGui.Parent then
+	_G.DeltaSpyProGui.Enabled = not _G.DeltaSpyProGui.Enabled
+	return
+end
+_G.DeltaSpyProLoaded = true
+
+local env = (type(getgenv) == "function" and getgenv()) or _G
+local fnHookMeta = env.hookmetamethod or hookmetamethod
+local fnGetNamecall = env.getnamecallmethod or getnamecallmethod
+local fnHookFunc = env.hookfunction or hookfunction
+local fnNewCClosure = env.newcclosure or newcclosure
+local fnCheckCaller = env.checkcaller or checkcaller
+
+local wrapClosure = (type(fnNewCClosure) == "function") and fnNewCClosure or function(f) return f end
+
+local State = {
+	Enabled = true,
+	Freeze = false,
+	Mode = "OUT", -- "OUT", "ALL", "IN"
+	Logs = {},
+	Selected = nil,
+	Excluded = {},
+	BlockedNames = {},
+	BlockedObjs = setmetatable({}, { __mode = "k" }),
+	Search = "",
+	DirtyUI = false,
+}
+
+local function isBlocked(rem)
+	if typeof(rem) ~= "Instance" then return false end
+	if State.BlockedObjs[rem] then return true end
+	if State.BlockedNames[rem.Name] then return true end
+	return false
+end
+
+local function isGameCall()
+	if type(fnCheckCaller) == "function" then
+		local ok, res = pcall(fnCheckCaller)
+		if ok then return not res end
+	end
+	return true
+end
+
+-- ================= SERIALIZER CHUẨN LUA =================
+local function serialize(val, depth, indent, seen)
+	depth = depth or 0
+	indent = indent or 0
+	seen = seen or {}
+	local pad = string.rep("\t", indent)
+	local inner = string.rep("\t", indent + 1)
+	local t = typeof(val)
+
+	if t == "string" then
+		return string.format("%q", val)
+	elseif t == "number" or t == "boolean" then
+		return tostring(val)
+	elseif t == "nil" then
+		return "nil"
+	elseif t == "Vector3" then
+		return string.format("Vector3.new(%s, %s, %s)", tostring(val.X), tostring(val.Y), tostring(val.Z))
+	elseif t == "Vector2" then
+		return string.format("Vector2.new(%s, %s)", tostring(val.X), tostring(val.Y))
+	elseif t == "CFrame" then
+		local c = { val:GetComponents() }
+		for i, v in ipairs(c) do c[i] = tostring(v) end
+		return "CFrame.new(" .. table.concat(c, ", ") .. ")"
+	elseif t == "Color3" then
+		return string.format("Color3.fromRGB(%d, %d, %d)", math.floor(val.R * 255 + 0.5), math.floor(val.G * 255 + 0.5), math.floor(val.B * 255 + 0.5))
+	elseif t == "UDim2" then
+		return string.format("UDim2.new(%s, %s, %s, %s)", tostring(val.X.Scale), tostring(val.X.Offset), tostring(val.Y.Scale), tostring(val.Y.Offset))
+	elseif t == "UDim" then
+		return string.format("UDim.new(%s, %s)", tostring(val.Scale), tostring(val.Offset))
+	elseif t == "EnumItem" then
+		return tostring(val)
+	elseif t == "Instance" then
+		local ok, full = pcall(function() return val:GetFullName() end)
+		if ok and type(full) == "string" and full ~= "" then
+			local parts = {}
+			for p in string.gmatch(full, "[^%.]+") do
+				table.insert(parts, p)
+			end
+			if #parts > 0 then
+				local expr = string.format("game:GetService(%q)", parts[1])
+				for i = 2, #parts do
+					expr = string.format("%s:WaitForChild(%q)", expr, parts[i])
+				end
+				return expr
+			end
+		end
+		return "nil"
+	elseif t == "table" then
+		if depth >= 4 or seen[val] then return "{}" end
+		seen[val] = true
+		local lines = {}
+		local count = 0
+		local isArr = (#val > 0)
+		for k, v in pairs(val) do
+			count += 1
+			if count > 40 then
+				table.insert(lines, inner .. "-- ...")
+				break
+			end
+			local vStr = serialize(v, depth + 1, indent + 1, seen)
+			if isArr and type(k) == "number" then
+				table.insert(lines, inner .. vStr)
+			elseif type(k) == "string" then
+				if k:match("^[%a_][%w_]*$") then
+					table.insert(lines, string.format("%s%s = %s", inner, k, vStr))
+				else
+					table.insert(lines, string.format("%s[%q] = %s", inner, k, vStr))
+				end
+			else
+				table.insert(lines, string.format("%s[%s] = %s", inner, serialize(k, depth + 1, 0, seen), vStr))
+			end
+		end
+		seen[val] = nil
+		if #lines == 0 then return "{}" end
+		return "{\n" .. table.concat(lines, ",\n") .. "\n" .. pad .. "}"
+	end
+
+	return string.format("%q", tostring(val))
+end
+
+local function getRemotePath(remote)
+	local ok, full = pcall(function() return remote:GetFullName() end)
+	if not ok or type(full) ~= "string" or full == "" then return "nil" end
+	local parts = {}
+	for p in string.gmatch(full, "[^%.]+") do
+		table.insert(parts, p)
+	end
+	local expr = string.format("game:GetService(%q)", parts[1])
+	for i = 2, #parts do
+		expr = string.format("%s:WaitForChild(%q)", expr, parts[i])
+	end
+	return expr
+end
+
+local function generateScript(remote, method, args)
+	local path = getRemotePath(remote)
+	local callMethod = (method == "InvokeServer") and "InvokeServer" or "FireServer"
+	if args and #args > 0 then
+		local argLines = {}
+		for i = 1, #args do
+			table.insert(argLines, "\t" .. serialize(args[i], 0, 1))
+		end
+		return string.format(
+			"local args = {\n%s\n}\n\n%s:%s(unpack(args))",
+			table.concat(argLines, ",\n"),
+			path,
+			callMethod
+		)
+	end
+	return string.format("%s:%s()", path, callMethod)
+end
+
+local function copyToClipboard(txt)
+	local fn = setclipboard or toclipboard or set_clipboard
+	if type(fn) == "function" then
+		return pcall(fn, txt)
+	end
+	return false
+end
+
+-- ================= GIAO DIỆN DELTA ANDROID =================
+local function attachGui(guiObj)
+	local ok1 = pcall(function() guiObj.Parent = PlayerGui end)
+	if ok1 and guiObj.Parent == PlayerGui then return end
+	pcall(function() guiObj.Parent = CoreGui end)
+end
+
+for _, parentObj in ipairs({ PlayerGui, CoreGui }) do
+	pcall(function()
+		local old = parentObj:FindFirstChild("DeltaSpyProUI")
+		if old then old:Destroy() end
+	end)
+end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "DeltaSpyProUI"
+sg.ResetOnSpawn = false
+sg.DisplayOrder = 999999
+sg.IgnoreGuiInset = true
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+attachGui(sg)
+_G.DeltaSpyProGui = sg
+
+local floatBtn = Instance.new("TextButton")
+floatBtn.Size = UDim2.new(0, 52, 0, 28)
+floatBtn.Position = UDim2.new(0, 12, 0, 62)
+floatBtn.BackgroundColor3 = Color3.fromRGB(28, 34, 46)
+floatBtn.BorderColor3 = Color3.fromRGB(85, 110, 150)
+floatBtn.BorderSizePixel = 1
+floatBtn.Text = "SPY"
+floatBtn.TextColor3 = Color3.fromRGB(150, 238, 185)
+floatBtn.Font = Enum.Font.Code
+floatBtn.TextSize = 12
+floatBtn.Active = true
+floatBtn.Draggable = true
+floatBtn.Parent = sg
+
+local cam = workspace.CurrentCamera
+local vp = (cam and cam.ViewportSize) or Vector2.new(800, 380)
+local winW = math.clamp(math.floor(vp.X * 0.78), 470, 640)
+local winH = math.clamp(math.floor(vp.Y * 0.74), 235, 315)
+local leftW = math.clamp(math.floor(winW * 0.32), 148, 195)
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, winW, 0, winH)
+main.Position = UDim2.new(0.5, -math.floor(winW / 2), 0.5, -math.floor(winH / 2) + 8)
+main.BackgroundColor3 = Color3.fromRGB(18, 20, 24)
+main.BorderColor3 = Color3.fromRGB(56, 64, 78)
+main.BorderSizePixel = 1
+main.Active = true
+main.Draggable = true
+main.Parent = sg
+
+local topH = 28
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, topH)
+topBar.BackgroundColor3 = Color3.fromRGB(26, 29, 36)
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+
+local titleLbl = Instance.new("TextLabel")
+titleLbl.Size = UDim2.new(0, leftW - 6, 1, 0)
+titleLbl.Position = UDim2.new(0, 8, 0, 0)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Text = "Delta Spy Pro"
+titleLbl.TextColor3 = Color3.fromRGB(240, 244, 250)
+titleLbl.Font = Enum.Font.Code
+titleLbl.TextSize = 12
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.TextTruncate = Enum.TextTruncate.AtEnd
+titleLbl.Parent = topBar
+
+local function topBtn(txt, x, w, col)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, w, 0, 20)
+	b.Position = UDim2.new(0, x, 0, 4)
+	b.BackgroundColor3 = col
+	b.BorderColor3 = Color3.fromRGB(72, 80, 96)
+	b.BorderSizePixel = 1
+	b.Text = txt
+	b.TextColor3 = Color3.fromRGB(240, 244, 250)
+	b.Font = Enum.Font.Code
+	b.TextSize = 10
+	b.Parent = topBar
+	return b
+end
+
+local rightAreaX = leftW + 12
+local rightAreaW = winW - rightAreaX - 8
+local topBtnAreaW = winW - leftW - 34
+local gap = 4
+local bw = math.floor((topBtnAreaW - gap * 4) / 5)
+local bx = leftW + 4
+
+local toggleBtn    = topBtn("ON",       bx,                  bw, Color3.fromRGB(32, 110, 64))
+local freezeBtn    = topBtn("FRZ: OFF", bx + (bw + gap) * 1, bw, Color3.fromRGB(62, 56, 82))
+local modeBtn      = topBtn("OUT ONLY", bx + (bw + gap) * 2, bw, Color3.fromRGB(40, 68, 104))
+local clearAllBtn  = topBtn("CLEAR",    bx + (bw + gap) * 3, bw, Color3.fromRGB(55, 50, 64))
+local unexcludeBtn = topBtn("RESET",    bx + (bw + gap) * 4, bw, Color3.fromRGB(50, 56, 68))
+local minBtn       = topBtn("X",        winW - 24,           20, Color3.fromRGB(120, 40, 46))
+
+local searchH = 22
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(0, leftW, 0, searchH)
+searchBox.Position = UDim2.new(0, 6, 0, topH + 5)
+searchBox.BackgroundColor3 = Color3.fromRGB(24, 27, 34)
+searchBox.BorderColor3 = Color3.fromRGB(52, 58, 70)
+searchBox.BorderSizePixel = 1
+searchBox.PlaceholderText = "Tìm remote / arg..."
+searchBox.PlaceholderColor3 = Color3.fromRGB(125, 134, 148)
+searchBox.Text = ""
+searchBox.TextColor3 = Color3.fromRGB(240, 244, 250)
+searchBox.Font = Enum.Font.Code
+searchBox.TextSize = 11
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = main
+
+local listTop = topH + searchH + 9
+local leftList = Instance.new("ScrollingFrame")
+leftList.Size = UDim2.new(0, leftW, 1, -(listTop + 6))
+leftList.Position = UDim2.new(0, 6, 0, listTop)
+leftList.BackgroundColor3 = Color3.fromRGB(13, 15, 19)
+leftList.BorderColor3 = Color3.fromRGB(44, 50, 60)
+leftList.BorderSizePixel = 1
+leftList.ScrollBarThickness = 4
+leftList.CanvasSize = UDim2.new(0, 0, 0, 0)
+leftList.Parent = main
+
+local leftLayout = Instance.new("UIListLayout")
+leftLayout.SortOrder = Enum.SortOrder.LayoutOrder
+leftLayout.Padding = UDim.new(0, 3)
+leftLayout.Parent = leftList
+
+leftLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	leftList.CanvasSize = UDim2.new(0, 0, 0, leftLayout.AbsoluteContentSize.Y + 6)
+end)
+
+local gridH = 52
+local codeH = winH - (topH + 5) - gridH - 12
+
+local codeFrame = Instance.new("ScrollingFrame")
+codeFrame.Size = UDim2.new(0, rightAreaW, 0, codeH)
+codeFrame.Position = UDim2.new(0, rightAreaX, 0, topH + 5)
+codeFrame.BackgroundColor3 = Color3.fromRGB(13, 15, 19)
+codeFrame.BorderColor3 = Color3.fromRGB(44, 50, 60)
+codeFrame.BorderSizePixel = 1
+codeFrame.ScrollBarThickness = 4
+codeFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+codeFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+codeFrame.Parent = main
+
+local codeBox = Instance.new("TextBox")
+codeBox.Size = UDim2.new(1, -10, 0, 0)
+codeBox.Position = UDim2.new(0, 5, 0, 5)
+codeBox.AutomaticSize = Enum.AutomaticSize.Y
+codeBox.BackgroundTransparency = 1
+codeBox.Text = "-- Thao tác trong game để bắt gói OUT. Bấm FRZ: ON khi cần đứng khung (vd: teleport)."
+codeBox.TextColor3 = Color3.fromRGB(145, 238, 185)
+codeBox.Font = Enum.Font.Code
+codeBox.TextSize = 11
+codeBox.TextWrapped = true
+codeBox.TextXAlignment = Enum.TextXAlignment.Left
+codeBox.TextYAlignment = Enum.TextYAlignment.Top
+codeBox.ClearTextOnFocus = false
+codeBox.MultiLine = true
+codeBox.Parent = codeFrame
+
+local btnGrid = Instance.new("Frame")
+btnGrid.Size = UDim2.new(0, rightAreaW, 0, gridH)
+btnGrid.Position = UDim2.new(0, rightAreaX, 0, topH + 5 + codeH + 4)
+btnGrid.BackgroundTransparency = 1
+btnGrid.Parent = main
+
+local function actionBtn(txt, colIdx, rowIdx, col)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0.32, 0, 0, 24)
+	b.Position = UDim2.new(colIdx * 0.34, 0, 0, rowIdx * 28)
+	b.BackgroundColor3 = col
+	b.BorderColor3 = Color3.fromRGB(64, 72, 86)
+	b.BorderSizePixel = 1
+	b.Text = txt
+	b.TextColor3 = Color3.fromRGB(240, 244, 250)
+	b.Font = Enum.Font.Code
+	b.TextSize = 10
+	b.TextTruncate = Enum.TextTruncate.AtEnd
+	b.Parent = btnGrid
+	return b
+end
+
+local copyCodeBtn   = actionBtn("Copy Code",   0, 0, Color3.fromRGB(36, 62, 96))
+local copyRemoteBtn = actionBtn("Copy Remote", 1, 0, Color3.fromRGB(36, 62, 96))
+local runCodeBtn    = actionBtn("Run Code",    2, 0, Color3.fromRGB(30, 98, 58))
+local excludeBtn    = actionBtn("Exclude",     0, 1, Color3.fromRGB(95, 72, 32))
+local blockBtn      = actionBtn("Block",       1, 1, Color3.fromRGB(130, 38, 44))
+local statusBox     = actionBtn("Sẵn sàng",    2, 1, Color3.fromRGB(28, 32, 40))
+
+local function syncBlockBtn(entry)
+	if not entry then
+		blockBtn.Text = "Block"
+		blockBtn.BackgroundColor3 = Color3.fromRGB(130, 38, 44)
+		return
+	end
+	local blk = State.BlockedNames[entry.name] or (entry.remote and State.BlockedObjs[entry.remote])
+	if blk then
+		blockBtn.Text = "Unblock"
+		blockBtn.BackgroundColor3 = Color3.fromRGB(38, 108, 64)
+	else
+		blockBtn.Text = "Block"
+		blockBtn.BackgroundColor3 = Color3.fromRGB(130, 38, 44)
+	end
+end
+
+local function allowDir(dir)
+	if State.Mode == "ALL" then return true end
+	return State.Mode == dir
+end
+
+local function refreshUI()
+	for _, ch in ipairs(leftList:GetChildren()) do
+		if ch:IsA("TextButton") then
+			ch:Destroy()
+		end
+	end
+
+	local q = State.Search:lower()
+	for i, entry in ipairs(State.Logs) do
+		if allowDir(entry.dir) and not State.Excluded[entry.name] then
+			local matchStr = (entry.name .. " " .. entry.scriptText):lower()
+			if q == "" or matchStr:find(q, 1, true) then
+				local blk = State.BlockedNames[entry.name] or (entry.remote and State.BlockedObjs[entry.remote])
+				local itemBtn = Instance.new("TextButton")
+				itemBtn.Size = UDim2.new(1, -6, 0, 24)
+				itemBtn.BackgroundColor3 = (State.Selected == i)
+					and Color3.fromRGB(44, 58, 82)
+					or (blk and Color3.fromRGB(56, 22, 26) or Color3.fromRGB(22, 26, 33))
+				itemBtn.BorderColor3 = blk
+					and Color3.fromRGB(190, 65, 75)
+					or ((entry.dir == "OUT") and Color3.fromRGB(48, 120, 82) or Color3.fromRGB(70, 85, 110))
+				itemBtn.BorderSizePixel = 1
+				local badge = (entry.count > 1) and (" (" .. entry.count .. ")") or ""
+				local prefix = blk and "[BLK]" or ("[" .. entry.dir .. "]")
+				itemBtn.Text = string.format(" %s %s%s", prefix, entry.name, badge)
+				itemBtn.TextColor3 = blk
+					and Color3.fromRGB(255, 155, 165)
+					or ((entry.dir == "OUT") and Color3.fromRGB(140, 235, 180) or Color3.fromRGB(185, 205, 235))
+				itemBtn.Font = Enum.Font.Code
+				itemBtn.TextSize = 10
+				itemBtn.TextXAlignment = Enum.TextXAlignment.Left
+				itemBtn.TextTruncate = Enum.TextTruncate.AtEnd
+				itemBtn.LayoutOrder = i
+				itemBtn.Parent = leftList
+
+				itemBtn.MouseButton1Click:Connect(function()
+					State.Selected = i
+					codeBox.Text = entry.scriptText
+					syncBlockBtn(entry)
+					statusBox.Text = entry.name
+					refreshUI()
+				end)
+			end
+		end
+	end
+end
+
+task.spawn(function()
+	while sg and sg.Parent do
+		if State.DirtyUI then
+			State.DirtyUI = false
+			pcall(refreshUI)
+		end
+		task.wait(0.12)
+	end
+end)
+
+local function logRemote(dir, remote, method, args)
+	if not State.Enabled then return end
+	if typeof(remote) ~= "Instance" then return end
+	if not allowDir(dir) then return end
+
+	local name = remote.Name
+	if State.Excluded[name] then return end
+
+	local scriptText = generateScript(remote, method, args)
+	local last = State.Logs[#State.Logs]
+	if last and last.name == name and last.dir == dir and last.scriptText == scriptText then
+		last.count += 1
+		State.DirtyUI = true
+		return
+	end
+
+	table.insert(State.Logs, {
+		dir = dir,
+		name = name,
+		remote = remote,
+		method = method,
+		scriptText = scriptText,
+		count = 1,
+	})
+
+	if #State.Logs > 250 then
+		table.remove(State.Logs, 1)
+		if State.Selected then
+			State.Selected -= 1
+			if State.Selected < 1 then State.Selected = nil end
+		end
+	end
+
+	State.DirtyUI = true
+end
+
+-- ================= CHỨC NĂNG ĐỨNG (BẬT/TẮT CHỦ ĐỘNG) =================
+local freezeConn = nil
+local function setFreeze(active)
+	State.Freeze = active
+	if active then
+		freezeBtn.Text = "FRZ: ON"
+		freezeBtn.BackgroundColor3 = Color3.fromRGB(165, 55, 55)
+		statusBox.Text = "Frozen!"
+		if not freezeConn then
+			freezeConn = RunService.RenderStepped:Connect(function()
+				if State.Freeze then
+					local t0 = os.clock()
+					while State.Freeze and (os.clock() - t0) < 0.045 do end
+				end
+			end)
+		end
+	else
+		freezeBtn.Text = "FRZ: OFF"
+		freezeBtn.BackgroundColor3 = Color3.fromRGB(62, 56, 82)
+		statusBox.Text = "Unfrozen"
+		if freezeConn then
+			freezeConn:Disconnect()
+			freezeConn = nil
+		end
+	end
+end
+
+-- ================= NÚT BẤM =================
+toggleBtn.MouseButton1Click:Connect(function()
+	State.Enabled = not State.Enabled
+	toggleBtn.Text = State.Enabled and "ON" or "OFF"
+	toggleBtn.BackgroundColor3 = State.Enabled and Color3.fromRGB(32, 110, 64) or Color3.fromRGB(140, 50, 50)
+end)
+
+freezeBtn.MouseButton1Click:Connect(function()
+	setFreeze(not State.Freeze)
+end)
+
+modeBtn.MouseButton1Click:Connect(function()
+	if State.Mode == "OUT" then
+		State.Mode = "ALL"
+		modeBtn.Text = "OUT + IN"
+	elseif State.Mode == "ALL" then
+		State.Mode = "IN"
+		modeBtn.Text = "IN ONLY"
+	else
+		State.Mode = "OUT"
+		modeBtn.Text = "OUT ONLY"
+	end
+	statusBox.Text = "Mode: " .. State.Mode
+	State.DirtyUI = true
+end)
+
+clearAllBtn.MouseButton1Click:Connect(function()
+	table.clear(State.Logs)
+	State.Selected = nil
+	codeBox.Text = "-- Đã xóa log."
+	syncBlockBtn(nil)
+	State.DirtyUI = true
+	statusBox.Text = "Đã xóa"
+end)
+
+unexcludeBtn.MouseButton1Click:Connect(function()
+	table.clear(State.Excluded)
+	table.clear(State.BlockedNames)
+	table.clear(State.BlockedObjs)
+	syncBlockBtn(State.Selected and State.Logs[State.Selected])
+	State.DirtyUI = true
+	statusBox.Text = "Đã mở khóa hết"
+end)
+
+copyCodeBtn.MouseButton1Click:Connect(function()
+	if copyToClipboard(codeBox.Text) then
+		statusBox.Text = "Copied Code!"
+	end
+end)
+
+copyRemoteBtn.MouseButton1Click:Connect(function()
+	local sel = State.Selected and State.Logs[State.Selected]
+	if sel and copyToClipboard(getRemotePath(sel.remote)) then
+		statusBox.Text = "Copied Path!"
+	end
+end)
+
+runCodeBtn.MouseButton1Click:Connect(function()
+	if type(loadstring) ~= "function" then return end
+	local fn, err = loadstring(codeBox.Text)
+	if not fn then
+		statusBox.Text = "Syntax Err"
+		return
+	end
+	local ok, runErr = pcall(fn)
+	statusBox.Text = ok and "Executed!" or "Run Err"
+	if not ok then warn("[DeltaSpyPro]", runErr) end
+end)
+
+excludeBtn.MouseButton1Click:Connect(function()
+	local sel = State.Selected and State.Logs[State.Selected]
+	if not sel then return end
+	State.Excluded[sel.name] = true
+	statusBox.Text = "Excluded " .. sel.name
+	State.DirtyUI = true
+end)
+
+blockBtn.MouseButton1Click:Connect(function()
+	local sel = State.Selected and State.Logs[State.Selected]
+	if not sel then
+		statusBox.Text = "Chưa chọn remote"
+		return
+	end
+	local currentlyBlocked = State.BlockedNames[sel.name] or (sel.remote and State.BlockedObjs[sel.remote])
+	if currentlyBlocked then
+		State.BlockedNames[sel.name] = nil
+		if sel.remote then State.BlockedObjs[sel.remote] = nil end
+		statusBox.Text = "Unblocked: " .. sel.name
+	else
+		State.BlockedNames[sel.name] = true
+		if sel.remote then State.BlockedObjs[sel.remote] = true end
+		statusBox.Text = "Blocked: " .. sel.name
+	end
+	syncBlockBtn(sel)
+	State.DirtyUI = true
+end)
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+	State.Search = searchBox.Text
+	State.DirtyUI = true
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+	main.Visible = not main.Visible
+end)
+
+floatBtn.MouseButton1Click:Connect(function()
+	main.Visible = not main.Visible
+end)
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+	if not gp and inp.KeyCode == Enum.KeyCode.RightShift then
+		main.Visible = not main.Visible
+	end
+end)
+
+-- ================= HOOK LAYER CHO DELTA =================
+if type(fnHookMeta) == "function" and type(fnGetNamecall) == "function" then
+	pcall(function()
+		local oldNamecall
+		oldNamecall = fnHookMeta(game, "__namecall", wrapClosure(function(self, ...)
+			local method = fnGetNamecall()
+			if typeof(self) == "Instance" and (method == "FireServer" or method == "InvokeServer") then
+				if self:IsA("RemoteEvent") or self:IsA("UnreliableRemoteEvent") or self:IsA("RemoteFunction") then
+					if isGameCall() then
+						if isBlocked(self) then
+							return nil
+						end
+						local args = { ... }
+						task.spawn(logRemote, "OUT", self, method, args)
+					end
+				end
+			end
+			return oldNamecall(self, ...)
+		end))
+	end)
+end
+
+if type(fnHookFunc) == "function" then
+	pcall(function()
+		local tmpEvent = Instance.new("RemoteEvent")
+		local oldFire
+		oldFire = fnHookFunc(tmpEvent.FireServer, wrapClosure(function(self, ...)
+			if typeof(self) == "Instance" and (self:IsA("RemoteEvent") or self:IsA("UnreliableRemoteEvent")) then
+				if isGameCall() then
+					if isBlocked(self) then
+						return nil
+					end
+					local args = { ... }
+					task.spawn(logRemote, "OUT", self, "FireServer", args)
+				end
+			end
+			return oldFire(self, ...)
+		end))
+		tmpEvent:Destroy()
+	end)
+
+	pcall(function()
+		local tmpFunc = Instance.new("RemoteFunction")
+		local oldInvoke
+		oldInvoke = fnHookFunc(tmpFunc.InvokeServer, wrapClosure(function(self, ...)
+			if typeof(self) == "Instance" and self:IsA("RemoteFunction") then
+				if isGameCall() then
+					if isBlocked(self) then
+						return nil
+					end
+					local args = { ... }
+					task.spawn(logRemote, "OUT", self, "InvokeServer", args)
+				end
+			end
+			return oldInvoke(self, ...)
+		end))
+		tmpFunc:Destroy()
+	end)
+end
+
+local hookedIn = setmetatable({}, { __mode = "k" })
+local function attachIn(obj)
+	if hookedIn[obj] then return end
+	if obj:IsA("RemoteEvent") or obj:IsA("UnreliableRemoteEvent") then
+		hookedIn[obj] = true
+		obj.OnClientEvent:Connect(function(...)
+			logRemote("IN", obj, "OnClientEvent", { ... })
+		end)
+	end
+end
+
+for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
+	attachIn(v)
+end
+ReplicatedStorage.DescendantAdded:Connect(attachIn)
+
+statusBox.Text = "Delta Ready"
